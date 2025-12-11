@@ -135,6 +135,84 @@ let markers = [];
 // store location lookups in a database to avoid repeated lookups
 let db = {};
 
+function maybeSplitLine(start, end) {
+  // Would it be shorter to cross the antimeridian?
+  if (Math.abs(start[0] - end[0]) > 180) {
+    // Distances from the antimeridian
+    const w1 = 180 - Math.abs(start[0]);
+    const w2 = 180 - Math.abs(end[0]);
+    // Interpolate latitude value at the antimeridian.
+    const y = (w1 / (w1 + w2)) * (end[1] - start[1]) + start[1];
+    return [
+      // Line from the start to the antimeridian
+      [
+        ol.proj.fromLonLat(start),
+        ol.proj.fromLonLat([start[0] > 0 ? 180 : -180, y])
+      ],
+      // Line from the antimeridian to the end
+      [
+        ol.proj.fromLonLat([end[0] > 0 ? 180 : -180, y]),
+        ol.proj.fromLonLat(end)
+      ]
+    ];
+  }
+  // Not shorter? Just return a single line.
+  return [[ol.proj.fromLonLat(start), ol.proj.fromLonLat(end)]];
+}
+
+// Openlayers' built-in extent and bounding box tools will not return an extent that crosses the antimeridian.
+function findSmallestExtent(bounds) {
+  // Get the extent the normal way; we'll use the latitude values.
+  let extent = ol.extent.boundingExtent(bounds);
+  // Get a sorted array of the marker longitudes
+  let longitudes = bounds.flatMap((a) => a[0]).sort((a, b) => a - b);
+  // We'll loop through the array and find the biggest gap.
+  let biggestGapIdx = 0;
+  let biggestGapLastIdx = longitudes.length - 1;
+  // Because the earth is a globe, the gap before the marker with the lowest longitude is it's distance to the
+  //  antimeridian, plus the distance from the antimeridian to the marker with the highest longitude.
+  let biggestGap = (longitudes[biggestGapIdx] - -180) + (180 - longitudes[biggestGapLastIdx]);
+  // We've already calculated [0]'s gap, so start with 1.
+  for (var i = 1; i < longitudes.length; i++) {
+    let gap = longitudes[i] - longitudes[i - 1];
+    if (gap > biggestGap) {
+      biggestGap = gap;
+      biggestGapIdx = i;
+      biggestGapLastIdx = i - 1;
+    }
+  }
+  // We want to wrap our extent around the globe in such a way as to produce coordinates as close to zero as possible,
+  //  to make the reposition move as little as necessary.
+  // Diagram key:
+  // [  -180
+  // +  0
+  // ]  180
+  // l  longitudes[biggestGapLastIdx]
+  // i  longitudes[biggestGapIdx]
+  // >  desired result
+  if (longitudes[biggestGapLastIdx] > longitudes[biggestGapIdx]) {
+    // [---------------i-----------------+-------l-------------------------]
+    // >               i-----------------+-------l
+    extent[0] = longitudes[biggestGapIdx];
+    extent[2] = longitudes[biggestGapLastIdx];
+  } else if (Math.abs(longitudes[biggestGapIdx]) > Math.abs(longitudes[biggestGapLastIdx])) {
+    //           [---------------------------------+-------l--------------i----------]
+    // >i------------------------------------------+-------l
+    //                      [-----------------------------l---+-----------i---------------------]
+    // >i-------------------------------------------------l
+    extent[0] = longitudes[biggestGapIdx] - 360;
+    extent[2] = longitudes[biggestGapLastIdx];
+  } else {
+    // [------l----------------------i---+---------------------------------]
+    // >                             i---+----------------------------------------l
+    // [------l--------------------------+----i----------------------------]
+    // >                                      i----------------------------------l
+    extent[0] = longitudes[biggestGapIdx];
+    extent[2] = longitudes[biggestGapLastIdx] + 360;
+  }
+  return [...ol.proj.fromLonLat(extent.slice(0, 2)), ...ol.proj.fromLonLat(extent.slice(2, 4))];
+}
+
 function draw(hosts) {
   hosts = hosts.filter(host => host.ip in db);
 
@@ -143,7 +221,7 @@ function draw(hosts) {
   for (let i=0; i < hosts.length; i++) {
     const host = hosts[i];
     const coords = ol.proj.fromLonLat(db[host.ip]);
-    bounds.push(coords);
+    bounds.push(db[host.ip]);
     const feature = new ol.Feature({
       geometry: new ol.geom.Point(coords),
     });
@@ -200,7 +278,7 @@ function draw(hosts) {
 
   // reposition map view
   if (bounds.length > 0) {
-    const extent = ol.extent.boundingExtent(bounds);
+    const extent = findSmallestExtent(bounds);
     // setTimeout is used since otherwise the animation blocks rendering of the markers and lines
     setTimeout(() => {
       map.getView().fit(extent, {
@@ -214,15 +292,11 @@ function draw(hosts) {
   for (let i=1; i < hosts.length; i++) {
     const host1 = hosts[i-1];
     const host2 = hosts[i];
-    // console.log("drawing line between", [ db[host1.ip], db[host2.ip] ]);
     const line = new ol.layer.Vector({
       source: new ol.source.Vector({
         features: [
           new ol.Feature({
-            geometry: new ol.geom.LineString([
-              ol.proj.fromLonLat(db[host1.ip]),
-              ol.proj.fromLonLat(db[host2.ip]),
-            ])
+            geometry: new ol.geom.MultiLineString(maybeSplitLine(db[host1.ip], db[host2.ip]))
           })
         ]
       }),
